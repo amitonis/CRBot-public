@@ -3,3 +3,21 @@
 
 # Python
 __pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Screenshots and temporary files
+screenshots/
+*.png
+*.jpg
+*.jpeg
+
+# Backup files
+*_backup.py
+*_corrupted*.py
+
+# Test files (optional - uncomment if you don't want to track test files)
+# test_*.py
+# *test*.py
+# diagnostic*.py

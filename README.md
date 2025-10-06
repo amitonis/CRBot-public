@@ -44,7 +44,14 @@
 <!-- ABOUT THE PROJECT -->
 ## About The Project
 
-A Python-based Clash Royale AI bot that learns and improves through gameplay. This project aims to help others understand machine learning, reinforcement learning, and game automation in a practical context.
+A **strategic** Python-based Clash Royale AI bot that uses Deep Q-Learning (DQN) and intelligent decision-making to play Clash Royale. The bot features advanced strategic gameplay including elixir management, card archetype detection, tactical decision-making, and dynamic positioning.
+
+## 🎯 **Strategic Features**
+- **Elixir Management**: Prevents elixir leaking above 9 elixir
+- **Card Archetype Detection**: Classifies 66+ cards across 7 categories (Tanks, Win Conditions, Spells, etc.)
+- **Tactical Decision-Making**: DEFEND, COUNTER_PUSH, PRESSURE, and PREVENT_LEAK strategies
+- **Dynamic Positioning**: 6-8 strategic positions based on tower status and card types
+- **Opponent Analysis**: Real-time troop detection and counter-play
 
 *(Disclaimer: This project is not affiliated with Supercell. Use at your own risk—automated gameplay may violate Clash Royale's Terms of Service.)*
 
@@ -139,9 +146,25 @@ A Python-based Clash Royale AI bot that learns and improves through gameplay. Th
 
 ![BlueStacks-window-tutorial](https://media1.giphy.com/media/v1.Y2lkPTc5MGI3NjExM3k2enMwY3E4cHJ0MDhnbmg1NnhsaDI3bGhmazJ4aXlxczFkamFxeSZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/y8yXKqwN40cdcr4yR5/giphy.gif)
 
-13. Log in (or make a new) account on Clash Royale, click on battle, then run train.py, but immediately after, make sure the BlueStacks emulator is the front-most window.
+13. Install Python dependencies:
+   ```bash
+   pip install -r requirements.txt
+   ```
 
-**NOTE:** The bot is broken right now, with it not handling "play again" correctly, as well as some minor bugs in gameplay. You can ask me any questions at the contacts page, or make contributions at the contributing page!
+14. Log in to Clash Royale, start a battle, then run the bot:
+   ```bash
+   python train.py
+   ```
+   **Important:** The bot needs an active battle to function properly. Make sure BlueStacks is the front-most window.
+
+## 🚀 **Quick Start**
+1. Start BlueStacks with Clash Royale
+2. Position window to the right side of screen (stretched)
+3. Enter a battle in Clash Royale
+4. Run `python train.py`
+5. Keep BlueStacks as the active window
+
+**The bot will now play strategically using advanced AI decision-making!**
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
