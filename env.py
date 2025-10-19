@@ -1,9 +1,11 @@
 import numpy as np
 import time
 import os
+import atexit
 import pyautogui
 import threading
 import random
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 from dotenv import load_dotenv
 from Actions import Actions
 from inference_sdk import InferenceHTTPClient
@@ -37,6 +39,24 @@ CARD_ARCHETYPES = {
     # Spells
     "SPELLS": ["Fireball", "Zap", "Arrows", "Lightning", "Rocket", "Log", "Freeze", "Tornado", "Poison", "Rage", "Mirror", "Clone"]
 }
+
+
+def _normalize_card_key(name):
+    if not name:
+        return ""
+    normalized = str(name).lower().replace("enemy", "").replace("ally", "")
+    normalized = normalized.replace("_", " ").replace("-", " ").strip()
+    return " ".join(normalized.split())
+
+
+CARD_ARCHETYPE_LOOKUP = {}
+for archetype, cards in CARD_ARCHETYPES.items():
+    for card_name in cards:
+        CARD_ARCHETYPE_LOOKUP[_normalize_card_key(card_name)] = archetype
+
+DEFAULT_ELIXIR_SOFT_CAP = 9.0
+DEFAULT_ELIXIR_HARD_CAP = 9.5
+DEFAULT_ELIXIR_LEAK_DURATION = 1.5
 
 # Elixir Management Constants
 MAX_ELIXIR = 10
@@ -80,11 +100,35 @@ class ClashRoyaleEnv:
         self.actions = Actions()
         self.rf_model = self.setup_roboflow()
         self.card_model = self.setup_card_roboflow()
+        self._workflow_executor = ThreadPoolExecutor(max_workers=4)
+        atexit.register(self._workflow_executor.shutdown, wait=False)
+        self._vision_timeout = float(os.getenv("VISION_WORKFLOW_TIMEOUT", "6"))
+        self._vision_retries = int(os.getenv("VISION_WORKFLOW_RETRIES", "1"))
+        self._troop_workflow_id = os.getenv("TROOP_WORKFLOW_ID", "custom-workflow-4")
+        self._card_workflow_id = os.getenv("CARD_WORKFLOW_ID", "custom-workflow-4")
         self.base_state_size = 1 + 2 * (MAX_ALLIES + MAX_ENEMIES)
 
         self.num_cards = 4
         self.grid_width = 18
         self.grid_height = 28
+        self._last_known_cards = ["Unknown"] * self.num_cards
+        self._last_unit_snapshot = {"allies": [], "enemies": []}
+        self._vision_failure_counter = 0
+        self.latest_card_archetypes = {"hand": [], "opponent": []}
+        self.current_threat_profile = {key: 0 for key in CARD_ARCHETYPES.keys()}
+        self.current_threat_profile["UNKNOWN"] = 0
+        self.hand_archetype_counts = {key: 0 for key in CARD_ARCHETYPES.keys()}
+        self.hand_archetype_counts["UNKNOWN"] = 0
+        self.ally_field_profile = {key: 0 for key in CARD_ARCHETYPES.keys()}
+        self.ally_field_profile["UNKNOWN"] = 0
+        self.opponent_playstyle = "UNKNOWN"
+        self.our_playstyle = "UNKNOWN"
+        self.elixir_dump_mode = False
+        self.elixir_soft_cap = float(os.getenv("ELIXIR_SOFT_CAP", str(DEFAULT_ELIXIR_SOFT_CAP)))
+        self.elixir_hard_cap = float(os.getenv("ELIXIR_HARD_CAP", str(DEFAULT_ELIXIR_HARD_CAP)))
+        self.elixir_leak_duration_cap = float(os.getenv("ELIXIR_LEAK_DURATION", str(DEFAULT_ELIXIR_LEAK_DURATION)))
+        if self.elixir_soft_cap > self.elixir_hard_cap:
+            self.elixir_soft_cap = max(self.elixir_hard_cap - 0.5, DEFAULT_ELIXIR_SOFT_CAP)
 
         self.screenshot_path = os.path.join(os.path.dirname(__file__), 'screenshots', "current.png")
         self.available_actions = self.get_available_actions()
@@ -307,23 +351,36 @@ class ClashRoyaleEnv:
         
         # Get actual elixir from game
         actual_elixir = self.actions.count_elixir()
-        if actual_elixir > 0:
+        if actual_elixir >= 0:
             self.current_elixir = actual_elixir
         
-        # Advanced leak detection with urgency levels
-        if self.current_elixir >= 10:  # Full elixir - CRITICAL leak
+        was_dumping = getattr(self, "elixir_dump_mode", False)
+
+        # Advanced leak detection with configurable thresholds
+        if self.current_elixir >= self.elixir_hard_cap:
             self.elixir_leak_time += time_since_last_check
             self.elixir_urgency = "CRITICAL"
-        elif self.current_elixir >= 9:  # Near full - HIGH urgency
-            self.elixir_leak_time += time_since_last_check * 0.5
+        elif self.current_elixir >= self.elixir_soft_cap:
+            self.elixir_leak_time += time_since_last_check
             self.elixir_urgency = "HIGH"
-        elif self.current_elixir >= 8:  # Getting high - MEDIUM urgency
+        elif self.current_elixir >= 8:
             self.elixir_urgency = "MEDIUM"
-        elif self.current_elixir >= 6:  # Good range - LOW urgency
+            self.elixir_leak_time = max(self.elixir_leak_time - time_since_last_check, 0)
+        elif self.current_elixir >= 6:
             self.elixir_urgency = "LOW"
-            self.elixir_leak_time = 0
-        else:  # Low elixir - SAVE mode
+            self.elixir_leak_time = max(self.elixir_leak_time - time_since_last_check, 0)
+        else:
             self.elixir_urgency = "SAVE"
+            self.elixir_leak_time = max(self.elixir_leak_time - time_since_last_check, 0)
+
+        self.elixir_dump_mode = (
+            self.elixir_leak_time >= self.elixir_leak_duration_cap or
+            self.current_elixir >= self.elixir_hard_cap
+        )
+        if self.elixir_dump_mode and not was_dumping:
+            print(f"⚡ Elixir dump mode active ({self.current_elixir:.1f}⚡, leak {self.elixir_leak_time:.1f}s)")
+        elif not self.elixir_dump_mode and was_dumping:
+            print("✅ Elixir leak mitigated")
             self.elixir_leak_time = 0
             
         self.last_elixir_check = current_time
@@ -345,6 +402,13 @@ class ClashRoyaleEnv:
         playable_cards = self.get_playable_cards(available_cards)
         if not playable_cards:
             return None
+
+        if self.elixir_dump_mode and playable_cards:
+            # Dump elixir by choosing highest cost card we can afford
+            heavy_priority = sorted(playable_cards, key=lambda c: self.get_card_cost(c), reverse=True)
+            chosen = heavy_priority[0]
+            print(f"⚡ Dumping elixir with {chosen} ({self.get_card_cost(chosen)}⚡)")
+            return chosen
             
         if strategy == "PREVENT_LEAK":
             if self.elixir_urgency == "CRITICAL":
@@ -496,9 +560,9 @@ class ClashRoyaleEnv:
         
         print(f"📍 Position {pos_key}: {'✅' if was_successful else '❌'} (Success: {success_rate:.1%})")
     
-    def get_adaptive_positions(self, card_archetype, avoid_recent_failures=True):
+    def get_adaptive_positions(self, card_name, avoid_recent_failures=True):
         """Get positions adapted to opponent behavior and success history"""
-        base_positions = self.get_strategic_positions(card_archetype)
+        base_positions = self.get_strategic_positions(card_name)
         
         if not base_positions:
             return base_positions
@@ -522,25 +586,21 @@ class ClashRoyaleEnv:
                     return data["successes"] / data["attempts"]
             return 0.5  # Default neutral success rate
         
-        # Add variety - don't always pick the same "best" position
         sorted_positions = sorted(base_positions, key=get_success_rate, reverse=True)
-        
-        # Use top 3 positions and rotate between them for variety
-        top_positions = sorted_positions[:3] if len(sorted_positions) >= 3 else sorted_positions
-        
-        # Track position variety to avoid repetition
-        for pos in top_positions:
+
+        # Track position variety to avoid repetition across the top options
+        for pos in sorted_positions:
             pos_key = f"{pos[0]:.1f},{pos[1]:.1f}"
             self.position_memory["position_variety_counter"][pos_key] = (
                 self.position_memory["position_variety_counter"].get(pos_key, 0) + 1
             )
-        
-        # Prefer less recently used positions for variety
-        variety_sorted = sorted(top_positions, 
-                              key=lambda p: self.position_memory["position_variety_counter"].get(
-                                  f"{p[0]:.1f},{p[1]:.1f}", 0))
-        
-        return variety_sorted
+
+        variety_sorted = sorted(
+            sorted_positions,
+            key=lambda p: self.position_memory["position_variety_counter"].get(f"{p[0]:.1f},{p[1]:.1f}", 0)
+        )
+
+        return variety_sorted[:8]
     
     def analyze_meta_game_state(self, current_elixir, enemy_troops, our_troops):
         """Analyze the current meta-game state for strategic decisions"""
@@ -603,6 +663,12 @@ class ClashRoyaleEnv:
             print(f"⚠️ Forced defense mode: {len(immediate_threats)} immediate threats")
             return
         
+        if self.opponent_playstyle == "ATTACKING":
+            self.action_context["mode"] = "DEFENSIVE"
+            self.action_context["counter_window"] = self.current_elixir >= 6
+            print("🛡️ Opponent on offense — prioritizing defense and counter setup")
+            return
+
         # 🔄 MODE SELECTION BASED ON GAME STATE
         if self.game_state["momentum"] == "LOSING":
             if self.game_state["elixir_advantage"] > 2:
@@ -626,6 +692,10 @@ class ClashRoyaleEnv:
                     self.action_context["mode"] = "AGGRESSIVE"  # Need to win
             else:
                 self.action_context["mode"] = "PROACTIVE"  # Mid-game pressure
+
+            if self.opponent_playstyle in ("DEFENDING", "SETTING_UP") and self.current_elixir >= 5:
+                self.action_context["mode"] = "PROACTIVE"
+                self.action_context["counter_window"] = True
         
         # 🎯 SPECIAL CONTEXTS
         time_since_opponent_aggression = current_time - self.action_context["last_opponent_aggression"]
@@ -703,6 +773,15 @@ class ClashRoyaleEnv:
         if not playable_cards:
             return None
         
+        threat_response = self.select_threat_response_card(playable_cards)
+        if threat_response:
+            card_name, rationale = threat_response
+            risk = self.assess_risk_reward(card_name, (0.5, 0.5), strategic_decision)
+            if risk["recommendation"] != "AVOID":
+                print(f"🛡️ Threat response: {card_name} ({rationale})")
+                return card_name
+            print(f"⚠️ Threat response {card_name} rejected due to risk ({risk['recommendation']})")
+
         # 🎲 RANDOMIZED STRATEGY ANALYSIS
         self.analyze_randomized_strategy()
         
@@ -840,6 +919,36 @@ class ClashRoyaleEnv:
             print(f"🎯 Final contextual choice: {base_choice} (risk: {final_risk_assessment['risk']:.2f}, reward: {final_risk_assessment['reward']:.2f})")
         
         return base_choice
+
+    def select_threat_response_card(self, playable_cards):
+        """Choose card archetypes tailored to current enemy threats."""
+        if not playable_cards:
+            return None
+
+        threat = self.current_threat_profile or {}
+        if not threat:
+            return None
+
+        tank_pressure = threat.get("TANKS", 0) + threat.get("WIN_CONDITIONS", 0)
+        mini_tank_pressure = threat.get("MINI_TANKS", 0)
+        swarm_pressure = threat.get("SWARM", 0)
+
+        priority_archetypes = []
+        if tank_pressure > 0:
+            priority_archetypes.extend(["BUILDINGS", "TANKS", "MINI_TANKS"])
+        if mini_tank_pressure > 0:
+            priority_archetypes.extend(["SWARM", "MINI_TANKS"])
+        if swarm_pressure >= 1:
+            priority_archetypes.extend(["SPELLS", "SWARM", "ANTI_AIR"])
+
+        if not priority_archetypes:
+            return None
+
+        for archetype in priority_archetypes:
+            for card in playable_cards:
+                if self.detect_card_archetype(card) == archetype:
+                    return card, archetype
+        return None
 
     def update_strategy_mixing(self):
         """🚀 Update mixed strategy distribution using regret-style adjustments"""
@@ -1364,10 +1473,114 @@ class ClashRoyaleEnv:
     
     def detect_card_archetype(self, card_name):
         """Determine the archetype of a card"""
-        for archetype, cards in CARD_ARCHETYPES.items():
-            if card_name in cards:
-                return archetype
+        key = _normalize_card_key(card_name)
+        if not key:
+            return "UNKNOWN"
+
+        archetype = CARD_ARCHETYPE_LOOKUP.get(key)
+        if archetype:
+            return archetype
+
+        # Heuristic fallbacks for cards not in lookup
+        if any(token in key for token in ["giant", "golem", "hound", "pekka", "mega knight", "tank", "golem"]):
+            return "TANKS"
+        if any(token in key for token in ["knight", "valk", "mini", "prince", "bandit", "lumberjack", "ram rider", "mini p", "dark prince"]):
+            return "MINI_TANKS"
+        if any(token in key for token in ["hog", "balloon", "graveyard", "battle ram", "ram rider", "royal giant", "xbow", "x bow", "mortar", "siege"]):
+            return "WIN_CONDITIONS"
+        if any(token in key for token in ["skeleton", "minion", "goblin", "barbar", "swarm", "recruits"]):
+            return "SWARM"
+        if any(token in key for token in ["tower", "building", "hut", "collector", "inferno", "tesla", "cannon", "furnace"]):
+            return "BUILDINGS"
+        if any(token in key for token in ["fireball", "zap", "lightning", "rocket", "poison", "log", "spell", "tornado", "freeze", "earthquake", "miner spell"]):
+            return "SPELLS"
+        if any(token in key for token in ["archer", "musketeer", "hunter", "wizard", "anti air", "inferno", "dragon"]):
+            return "ANTI_AIR"
+
         return "UNKNOWN"
+
+    def _update_hand_archetypes(self, cards):
+        archetypes = []
+        counts = {key: 0 for key in self.hand_archetype_counts.keys()}
+        for card in cards:
+            archetype = self.detect_card_archetype(card)
+            archetypes.append(archetype)
+            counts[archetype] = counts.get(archetype, 0) + 1
+        self.latest_card_archetypes["hand"] = archetypes
+        self.hand_archetype_counts = counts
+
+    def _infer_playstyle(self, forward_units, backline_units, total_units, *, perspective):
+        if total_units == 0:
+            return "IDLE"
+
+        forward_threshold = max(1, int(total_units * 0.5))
+        backline_threshold = max(1, int(total_units * 0.5))
+
+        if perspective == "enemy":
+            if forward_units >= forward_threshold:
+                return "ATTACKING"
+            if backline_units >= backline_threshold:
+                return "DEFENDING"
+            return "SETTING_UP"
+
+        # Our perspective
+        if forward_units >= forward_threshold:
+            return "PRESSURING"
+        if backline_units >= backline_threshold:
+            return "DEFENDING"
+        return "CYCLE"
+
+    def _evaluate_entities(self, entities, *, perspective):
+        counts = {key: 0 for key in CARD_ARCHETYPES.keys()}
+        counts["UNKNOWN"] = 0
+        archetypes = []
+        forward_units = 0
+        backline_units = 0
+        total_units = 0
+
+        for entity in entities:
+            card_label = entity.get("class", "")
+            archetype = self.detect_card_archetype(card_label)
+            if archetype not in counts:
+                counts[archetype] = 0
+            counts[archetype] += 1
+            archetypes.append(archetype)
+
+            y_norm = entity.get("y_norm")
+            if y_norm is None and self.actions.HEIGHT:
+                y_norm = entity.get("y", 0.0) / max(self.actions.HEIGHT, 1)
+            if y_norm is None:
+                y_norm = 0.5
+
+            if perspective == "enemy":
+                if y_norm >= 0.6:
+                    forward_units += 1
+                elif y_norm <= 0.4:
+                    backline_units += 1
+            else:
+                if y_norm <= 0.4:
+                    forward_units += 1
+                elif y_norm >= 0.6:
+                    backline_units += 1
+
+            total_units += 1
+
+        playstyle = self._infer_playstyle(forward_units, backline_units, total_units, perspective=perspective)
+        return counts, archetypes, playstyle
+
+    def update_battlefield_dynamics(self, ally_entities, enemy_entities):
+        enemy_counts, enemy_archetypes, enemy_playstyle = self._evaluate_entities(enemy_entities, perspective="enemy")
+        self.current_threat_profile = enemy_counts
+        self.latest_card_archetypes["opponent"] = enemy_archetypes
+        if enemy_playstyle != self.opponent_playstyle:
+            print(f"🧠 Opponent playstyle detected: {enemy_playstyle}")
+        self.opponent_playstyle = enemy_playstyle
+        if enemy_playstyle == "ATTACKING":
+            self.action_context["last_opponent_aggression"] = time.time()
+
+        ally_counts, _, ally_playstyle = self._evaluate_entities(ally_entities, perspective="ally")
+        self.our_playstyle = ally_playstyle
+        self.ally_field_profile = ally_counts
     
     def analyze_opponent_troops(self, enemy_troops):
         """Analyze opponent's troops and update strategy"""
@@ -1431,20 +1644,31 @@ class ClashRoyaleEnv:
         if not enemy_troops:
             return False
         
-        # Count enemies near our towers (y > 0.6 = approaching our side)
-        threats_near_towers = sum(1 for troop in enemy_troops if troop['y'] > 0.6)
+        def norm_y(troop):
+            y_norm = troop.get('y_norm')
+            if y_norm is None and self.actions.HEIGHT:
+                y_norm = troop.get('y', 0) / max(self.actions.HEIGHT, 1)
+            return y_norm if y_norm is not None else 0.5
+        
+        threats_near_towers = sum(1 for troop in enemy_troops if norm_y(troop) > 0.6)
         
         # Defend if multiple threats or single threat very close
-        return threats_near_towers >= 2 or any(troop['y'] > 0.8 for troop in enemy_troops)
+        return threats_near_towers >= 2 or any(norm_y(troop) > 0.8 for troop in enemy_troops)
     
     def should_counter_push(self, our_troops, enemy_troops):
         """Determine if we should counter-push"""
         if not our_troops:
             return False
             
+        def norm_y(troop):
+            y_norm = troop.get('y_norm')
+            if y_norm is None and self.actions.HEIGHT:
+                y_norm = troop.get('y', 0) / max(self.actions.HEIGHT, 1)
+            return y_norm if y_norm is not None else 0.5
+        
         # Counter-push if we have troops advancing and enemy has few defenders
-        our_advancing = sum(1 for troop in our_troops if troop['y'] < 0.4)  # Our troops on enemy side
-        enemy_defending = sum(1 for troop in enemy_troops if troop['y'] < 0.5)  # Enemy troops defending
+        our_advancing = sum(1 for troop in our_troops if norm_y(troop) < 0.4)
+        enemy_defending = sum(1 for troop in enemy_troops if norm_y(troop) < 0.5)
         
         return our_advancing > 0 and enemy_defending <= 1
     
@@ -1452,7 +1676,13 @@ class ClashRoyaleEnv:
         """Determine if we should apply pressure"""
         # Pressure if we have elixir advantage and no immediate threats
         elixir_advantage = self.current_elixir - self.opponent_elixir_estimate
-        immediate_threats = sum(1 for troop in enemy_troops if troop['y'] > 0.7)
+        def norm_y(troop):
+            y_norm = troop.get('y_norm')
+            if y_norm is None and self.actions.HEIGHT:
+                y_norm = troop.get('y', 0) / max(self.actions.HEIGHT, 1)
+            return y_norm if y_norm is not None else 0.5
+
+        immediate_threats = sum(1 for troop in enemy_troops if norm_y(troop) > 0.7)
         
         return (elixir_advantage > 2 and 
                 immediate_threats == 0 and 
@@ -1462,6 +1692,9 @@ class ClashRoyaleEnv:
         """Make strategic decision based on game state and elixir management"""
         # Update elixir management first
         self.update_elixir_management()
+
+        if self.elixir_dump_mode:
+            return "PREVENT_LEAK"
         
         # Analyze opponent troops
         self.analyze_opponent_troops(enemy_troops)
@@ -1483,31 +1716,38 @@ class ClashRoyaleEnv:
         elif self.elixir_urgency == "HIGH":
             return "PREVENT_LEAK"
         
+        # Tempo-based adjustments based on detected playstyle
+        if self.opponent_playstyle == "ATTACKING":
+            if self.should_defend(enemy_troops):
+                return "DEFEND"
+            if self.current_elixir >= 6 and self.should_counter_push(our_troops, enemy_troops):
+                return "COUNTER_PUSH"
+        elif self.opponent_playstyle in ["DEFENDING", "SETTING_UP", "IDLE"]:
+            if self.current_elixir >= 5 and not self.should_defend(enemy_troops):
+                return "PRESSURE"
+
         # Priority 4: Counter-push with good elixir (6+ elixir)
-        elif self.should_counter_push(our_troops, enemy_troops) and self.current_elixir >= 6:
+        if self.should_counter_push(our_troops, enemy_troops) and self.current_elixir >= 6:
             return "COUNTER_PUSH"
         
         # Priority 5: Medium elixir management (8 elixir)
-        elif self.elixir_urgency == "MEDIUM":
+        if self.elixir_urgency == "MEDIUM":
             if enemy_troops:  # If enemies present, defend efficiently
                 return "DEFEND"
-            else:  # Otherwise apply pressure
-                return "PRESSURE"
+            return "PRESSURE"
         
         # Priority 6: Apply pressure when safe (5-7 elixir, no immediate threats)
-        elif self.should_pressure(self.current_elixir, enemy_troops) and self.current_elixir >= 5:
+        if self.should_pressure(self.current_elixir, enemy_troops) and self.current_elixir >= 5:
             return "PRESSURE"
         
         # Priority 7: Save elixir when low (2-4 elixir)
-        elif self.elixir_urgency == "SAVE":
+        if self.elixir_urgency == "SAVE":
             if self.should_defend(enemy_troops):  # Only play if absolutely necessary
                 return "DEFEND"
-            else:
-                return "WAIT"
+            return "WAIT"
         
         # Default: Wait for better opportunity or elixir
-        else:
-            return "WAIT"
+        return "WAIT"
     
     def get_strategic_positions(self, card_name=None):
         """Get 6-8 strategic positions based on tower status and card type"""
@@ -1561,24 +1801,49 @@ class ClashRoyaleEnv:
             
             if card_archetype == "TANKS":
                 # Tanks - behind towers or bridge for push
-                positions = [(0.2, 0.6), (0.8, 0.6), (0.5, 0.7), (0.3, 0.5), (0.7, 0.5), (0.4, 0.7)]
+                positions = [
+                    (0.2, 0.6), (0.8, 0.6),
+                    (0.5, 0.7), (0.4, 0.65),
+                    (0.3, 0.5), (0.7, 0.5),
+                    (0.45, 0.72), (0.55, 0.72)
+                ]
             elif card_archetype == "WIN_CONDITIONS":
                 # Win conditions - bridge positions and protected spots
-                positions = [(0.2, 0.5), (0.8, 0.5), (0.3, 0.6), (0.7, 0.6), (0.5, 0.5), (0.4, 0.4)]
+                positions = [
+                    (0.2, 0.5), (0.8, 0.5),
+                    (0.3, 0.6), (0.7, 0.6),
+                    (0.5, 0.5), (0.4, 0.4),
+                    (0.6, 0.45), (0.5, 0.42)
+                ]
             elif card_archetype == "SWARM":
                 # Swarm - defensive and counter positions
-                positions = [(0.4, 0.7), (0.6, 0.7), (0.3, 0.6), (0.7, 0.6), (0.5, 0.8), (0.2, 0.6)]
+                positions = [
+                    (0.4, 0.7), (0.6, 0.7),
+                    (0.3, 0.6), (0.7, 0.6),
+                    (0.5, 0.8), (0.2, 0.6),
+                    (0.8, 0.55), (0.5, 0.65)
+                ]
             elif card_archetype == "BUILDINGS":
                 # Buildings - defensive positions only
-                positions = [(0.4, 0.8), (0.6, 0.8), (0.5, 0.75), (0.3, 0.8), (0.7, 0.8), (0.5, 0.9)]
+                positions = [
+                    (0.4, 0.8), (0.6, 0.8),
+                    (0.5, 0.75), (0.3, 0.8),
+                    (0.7, 0.8), (0.5, 0.9),
+                    (0.45, 0.85), (0.55, 0.85)
+                ]
             elif card_archetype == "SPELLS":
                 # Spells - enemy positions for damage
-                positions = [(0.3, 0.3), (0.7, 0.3), (0.5, 0.2), (0.4, 0.4), (0.6, 0.4), (0.5, 0.35)]
+                positions = [
+                    (0.3, 0.3), (0.7, 0.3),
+                    (0.5, 0.2), (0.4, 0.4),
+                    (0.6, 0.4), (0.5, 0.35),
+                    (0.45, 0.25), (0.55, 0.25)
+                ]
             else:
                 # Default positions
-                positions = base_positions[:6]
+                positions = base_positions[:8]
         else:
-            positions = base_positions
+            positions = base_positions[:8]
         
         # Ensure we return 6-8 positions as requested
         return positions[:8]
@@ -1713,11 +1978,17 @@ class ClashRoyaleEnv:
         opponent_troops = []
         enemy_entities = getattr(self, "latest_enemy_entities", [])
         for entity in enemy_entities:
-            ex_norm = entity.get("x", 0.0) / self.actions.WIDTH if self.actions.WIDTH else 0.0
-            ey_norm = entity.get("y", 0.0) / self.actions.HEIGHT if self.actions.HEIGHT else 0.0
+            ex_norm = entity.get("x_norm")
+            ey_norm = entity.get("y_norm")
+            if ex_norm is None and self.actions.WIDTH:
+                ex_norm = entity.get("x", 0.0) / max(self.actions.WIDTH, 1)
+            if ey_norm is None and self.actions.HEIGHT:
+                ey_norm = entity.get("y", 0.0) / max(self.actions.HEIGHT, 1)
             opponent_troops.append({
-                'x': entity.get("x", int(ex_norm * self.actions.WIDTH)),
-                'y': entity.get("y", int(ey_norm * self.actions.HEIGHT)),
+                'x': entity.get("x", int((ex_norm or 0) * self.actions.WIDTH)),
+                'y': entity.get("y", int((ey_norm or 0) * self.actions.HEIGHT)),
+                'x_norm': ex_norm,
+                'y_norm': ey_norm,
                 'class': entity.get("class", "enemy_troop"),
                 'confidence': entity.get("confidence", 0.0)
             })
@@ -1742,6 +2013,8 @@ class ClashRoyaleEnv:
                     our_troops.append({
                         'x': ax_px, 
                         'y': ay_px,
+                        'x_norm': ax,
+                        'y_norm': ay,
                         'class': 'ally_troop'
                     })
         
@@ -1816,21 +2089,21 @@ class ClashRoyaleEnv:
                 return next_state, -1, False  # Small penalty for bad elixir management
             
             # 📍 ADAPTIVE POSITIONING - Use success history and avoid failures
-            strategic_positions = self.get_adaptive_positions(card_archetype)
+            strategic_positions = self.get_adaptive_positions(card_name)
             
             # Choose best strategic position based on decision
             if strategic_positions:
-                if strategic_decision == "defend" and opponent_troops:
+                if strategic_decision == "DEFEND" and opponent_troops:
                     # Find position closest to strongest threat
-                    threat_y = max(troop['y'] for troop in opponent_troops)
+                    threat_y = max((troop.get('y_norm') if troop.get('y_norm') is not None else troop.get('y', 0) / max(self.actions.HEIGHT, 1)) for troop in opponent_troops)
                     best_pos = min(strategic_positions, key=lambda pos: abs(pos[1] - threat_y))
-                elif strategic_decision == "counter_push":
+                elif strategic_decision == "COUNTER_PUSH":
                     # Use offensive positions (lower y values)
-                    offensive_positions = [pos for pos in strategic_positions if pos[1] < self.actions.HEIGHT * 0.5]
+                    offensive_positions = [pos for pos in strategic_positions if pos[1] < 0.5]
                     best_pos = offensive_positions[0] if offensive_positions else strategic_positions[0]
-                elif strategic_decision == "pressure":
+                elif strategic_decision == "PRESSURE":
                     # Use bridge positions for pressure
-                    bridge_positions = [pos for pos in strategic_positions if abs(pos[1] - self.actions.HEIGHT * 0.5) < 50]
+                    bridge_positions = [pos for pos in strategic_positions if 0.4 <= pos[1] <= 0.6]
                     best_pos = bridge_positions[0] if bridge_positions else strategic_positions[0]
                 else:
                     # Default to first strategic position
@@ -1948,70 +2221,92 @@ class ClashRoyaleEnv:
         if not workspace_name:
             raise ValueError("WORKSPACE_TROOP_DETECTION environment variable is not set. Please check your .env file.")
         
-        results = self.rf_model.run_workflow(
-            workspace_name=workspace_name,
-            workflow_id="custom-workflow-4",
-            images={"image": self.screenshot_path},
-            use_cache=True
-        )
+        try:
+            results = self._safe_run_workflow(
+                self.rf_model,
+                workspace_name=workspace_name,
+                workflow_id=self._troop_workflow_id,
+                images={"image": self.screenshot_path},
+                use_cache=True,
+                timeout=self._vision_timeout,
+                retries=self._vision_retries
+            )
+            print("RAW results:", results)
+        except Exception as exc:  # noqa: BLE001 - we want to degrade gracefully here
+            print(f"ERROR: Troop detection workflow failed ({exc}).")
+            results = None
 
-        print("RAW results:", results)
-
-        # Handle new structure: dict with "predictions" key
-        predictions = []
-        if isinstance(results, dict) and "predictions" in results:
-            predictions = results["predictions"]
-        elif isinstance(results, list) and results:
-            first = results[0]
-            if isinstance(first, dict) and "predictions" in first:
-                predictions = first["predictions"]
+        predictions = self._normalize_workflow_predictions(results) if results is not None else []
         print("Predictions:", predictions)
-        if not predictions:
-            print("WARNING: No predictions found in results")
-            self.latest_enemy_entities = []
-            self.latest_ally_entities = []
-            return None
 
-        # After getting 'predictions' from results:
-        if isinstance(predictions, dict) and "predictions" in predictions:
-            predictions = predictions["predictions"]
+        ally_entities = []
+        enemy_entities = []
+        allies = []
+        enemies = []
 
-        print("RAW predictions:", predictions)
-        print("Detected classes:", [repr(p.get("class", "")) for p in predictions if isinstance(p, dict)])
+        if predictions:
+            self._vision_failure_counter = 0
+            print("RAW predictions:", predictions)
+            print("Detected classes:", [repr(p.get("class", "")) for p in predictions if isinstance(p, dict)])
 
-        TOWER_CLASSES = {
+            TOWER_CLASSES = {
             "ally king tower",
             "ally princess tower",
             "enemy king tower",
             "enemy princess tower"
-        }
-
-        def normalize_class(cls):
-            return cls.strip().lower() if isinstance(cls, str) else ""
-
-        allies = []
-        enemies = []
-        ally_entities = []
-        enemy_entities = []
-
-        for p in predictions:
-            if not isinstance(p, dict):
-                continue
-            cls = normalize_class(p.get("class", ""))
-            if cls in TOWER_CLASSES or "x" not in p or "y" not in p:
-                continue
-            entity = {
-                "class": cls,
-                "x": p["x"],
-                "y": p["y"],
-                "confidence": p.get("confidence", 0.0)
             }
-            if cls.startswith("ally"):
-                allies.append((p["x"], p["y"]))
-                ally_entities.append(entity)
-            elif cls.startswith("enemy") or cls:
-                enemies.append((p["x"], p["y"]))
-                enemy_entities.append(entity)
+
+            def normalize_class(cls):
+                return cls.strip().lower() if isinstance(cls, str) else ""
+
+            for p in predictions:
+                if not isinstance(p, dict):
+                    continue
+                cls = normalize_class(p.get("class", ""))
+                if cls in TOWER_CLASSES or "x" not in p or "y" not in p:
+                    continue
+                x_val = p["x"]
+                y_val = p["y"]
+                x_norm = x_val / self.actions.WIDTH if self.actions.WIDTH else 0.0
+                y_norm = y_val / self.actions.HEIGHT if self.actions.HEIGHT else 0.0
+                entity = {
+                    "class": cls,
+                    "x": x_val,
+                    "y": y_val,
+                    "x_norm": x_norm,
+                    "y_norm": y_norm,
+                    "confidence": p.get("confidence", 0.0)
+                }
+                if cls.startswith("ally"):
+                    allies.append((p["x"], p["y"]))
+                    ally_entities.append(entity)
+                elif cls.startswith("enemy") or cls:
+                    enemies.append((p["x"], p["y"]))
+                    enemy_entities.append(entity)
+
+            self._last_unit_snapshot = {
+                "allies": [dict(entity) for entity in ally_entities],
+                "enemies": [dict(entity) for entity in enemy_entities]
+            }
+        else:
+            self._vision_failure_counter += 1
+            if self._vision_failure_counter == 1 or self._vision_failure_counter % 10 == 0:
+                print(f"WARNING: No troop predictions available (streak {self._vision_failure_counter}).")
+
+            if self._last_unit_snapshot["allies"] or self._last_unit_snapshot["enemies"]:
+                print("ℹ️ Using cached troop entities from previous frame.")
+                ally_entities = [dict(entity) for entity in self._last_unit_snapshot["allies"]]
+                enemy_entities = [dict(entity) for entity in self._last_unit_snapshot["enemies"]]
+                allies = [(entity["x"], entity["y"]) for entity in ally_entities]
+                enemies = [(entity["x"], entity["y"]) for entity in enemy_entities]
+            else:
+                ally_entities = []
+                enemy_entities = []
+
+        if not allies:
+            allies = [(entity["x"], entity["y"]) for entity in ally_entities]
+        if not enemies:
+            enemies = [(entity["x"], entity["y"]) for entity in enemy_entities]
 
         print("Allies:", allies)
         print("Enemies:", enemies)
@@ -2019,6 +2314,7 @@ class ClashRoyaleEnv:
         # Persist latest entity information for downstream strategic modules
         self.latest_ally_entities = ally_entities
         self.latest_enemy_entities = enemy_entities
+        self.update_battlefield_dynamics(ally_entities, enemy_entities)
 
         # Normalize positions
         def normalize(units):
@@ -2145,37 +2441,61 @@ class ClashRoyaleEnv:
             card_paths = self.actions.capture_individual_cards()
             print("\nTesting individual card predictions:")
 
-            cards = []
             workspace_name = os.getenv('WORKSPACE_CARD_DETECTION')
             if not workspace_name:
                 raise ValueError("WORKSPACE_CARD_DETECTION environment variable is not set. Please check your .env file.")
             
-            for card_path in card_paths:
-                results = self.card_model.run_workflow(
-                    workspace_name=workspace_name,
-                    workflow_id="custom-workflow-4",
-                    images={"image": card_path},
-                    use_cache=True
-                )
-                # print("Card detection raw results:", results)  # Debug print
+            if not card_paths:
+                print("No card crops captured; returning cached hand.")
+                return list(self._last_known_cards)
 
-                # Fix: parse nested structure
-                predictions = []
-                if isinstance(results, list) and results:
-                    preds_dict = results[0].get("predictions", {})
-                    if isinstance(preds_dict, dict):
-                        predictions = preds_dict.get("predictions", [])
-                if predictions:
-                    card_name = predictions[0]["class"]
-                    print(f"Detected card: {card_name}")
+            cards = []
+            cached_cards = list(self._last_known_cards)
+
+            for idx, card_path in enumerate(card_paths):
+                card_name = "Unknown"
+                try:
+                    results = self._safe_run_workflow(
+                        self.card_model,
+                        workspace_name=workspace_name,
+                        workflow_id=self._card_workflow_id,
+                        images={"image": card_path},
+                        use_cache=True,
+                        timeout=self._vision_timeout,
+                        retries=self._vision_retries
+                    )
+                except Exception as exc:  # noqa: BLE001 - degrade gracefully and fall back to cache
+                    print(f"Card detection failed for slot {idx}: {exc}")
+                    if idx < len(cached_cards) and cached_cards[idx] != "Unknown":
+                        card_name = cached_cards[idx]
+                        print(f"🔁 Using cached card '{card_name}' for slot {idx}")
                     cards.append(card_name)
+                    continue
+
+                predictions = self._normalize_workflow_predictions(results)
+                if predictions:
+                    best_prediction = max(predictions, key=lambda p: p.get("confidence", 0.0))
+                    card_name = best_prediction.get("class", "Unknown") or "Unknown"
+                    print(f"Detected card: {card_name}")
                 else:
                     print("No card detected.")
-                    cards.append("Unknown")
-            return cards
+                    if idx < len(cached_cards) and cached_cards[idx] != "Unknown":
+                        card_name = cached_cards[idx]
+                        print(f"🔁 Using cached card '{card_name}' for slot {idx}")
+
+                cards.append(card_name)
+
+            while len(cards) < self.num_cards:
+                fallback_card = cached_cards[len(cards)] if len(cached_cards) > len(cards) else "Unknown"
+                cards.append(fallback_card)
+
+            self._last_known_cards = cards[:self.num_cards]
+            self._update_hand_archetypes(self._last_known_cards)
+            return cards[:self.num_cards]
         except Exception as e:
             print(f"Error in detect_cards_in_hand: {e}")
-            return []
+            self._update_hand_archetypes(self._last_known_cards)
+            return list(self._last_known_cards)
 
     def get_available_actions(self):
         """Generate all possible actions"""
@@ -2187,6 +2507,49 @@ class ClashRoyaleEnv:
         ]
         actions.append([-1, 0, 0])  # No-op action
         return actions
+
+    def _safe_run_workflow(self, model, *, workspace_name, workflow_id, images, use_cache=True, timeout=None, retries=None):
+        timeout = timeout if timeout is not None else self._vision_timeout
+        total_attempts = (retries if retries is not None else self._vision_retries) + 1
+        last_exception = None
+
+        for attempt_index in range(total_attempts):
+            future = self._workflow_executor.submit(
+                model.run_workflow,
+                workspace_name=workspace_name,
+                workflow_id=workflow_id,
+                images=images,
+                use_cache=use_cache
+            )
+            try:
+                return future.result(timeout=timeout)
+            except FuturesTimeout:
+                future.cancel()
+                last_exception = TimeoutError(f"Workflow '{workflow_id}' timed out after {timeout} seconds (attempt {attempt_index + 1}/{total_attempts})")
+            except Exception as exc:  # noqa: BLE001 - Broad catch to support retry logic
+                future.cancel()
+                last_exception = exc
+
+            backoff = 0.2 * (attempt_index + 1)
+            time.sleep(backoff)
+
+        raise last_exception
+
+    @staticmethod
+    def _normalize_workflow_predictions(results):
+        predictions = []
+
+        if isinstance(results, dict):
+            predictions = results.get("predictions", [])
+        elif isinstance(results, list) and results:
+            first = results[0]
+            if isinstance(first, dict):
+                predictions = first.get("predictions", [])
+
+        if isinstance(predictions, dict):
+            predictions = predictions.get("predictions", [])
+
+        return predictions if isinstance(predictions, list) else []
 
     def _endgame_watcher(self):
         while not self._endgame_thread_stop.is_set():
@@ -2204,17 +2567,21 @@ class ClashRoyaleEnv:
         if not workspace_name:
             raise ValueError("WORKSPACE_TROOP_DETECTION environment variable is not set. Please check your .env file.")
         
-        results = self.rf_model.run_workflow(
-            workspace_name=workspace_name,
-            workflow_id="custom-workflow-4",
-            images={"image": self.screenshot_path},
-            use_cache=True
-        )
-        predictions = []
-        if isinstance(results, dict) and "predictions" in results:
-            predictions = results["predictions"]
-        elif isinstance(results, list) and results:
-            first = results[0]
-            if isinstance(first, dict) and "predictions" in first:
-                predictions = first["predictions"]
+        try:
+            results = self._safe_run_workflow(
+                self.rf_model,
+                workspace_name=workspace_name,
+                workflow_id=self._troop_workflow_id,
+                images={"image": self.screenshot_path},
+                use_cache=True,
+                timeout=self._vision_timeout,
+                retries=self._vision_retries
+            )
+        except Exception as exc:  # noqa: BLE001 - degrade gracefully
+            print(f"⚠️ Princess tower detection failed: {exc}")
+            if self.prev_enemy_princess_towers is not None:
+                return self.prev_enemy_princess_towers
+            return 2
+
+        predictions = self._normalize_workflow_predictions(results)
         return sum(1 for p in predictions if isinstance(p, dict) and p.get("class") == "enemy princess tower")
