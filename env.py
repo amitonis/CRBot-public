@@ -8,7 +8,6 @@ from dotenv import load_dotenv
 from Actions import Actions
 from inference_sdk import InferenceHTTPClient
 
-# Load environment variables from .env file
 load_dotenv()
 
 MAX_ENEMIES = 10
@@ -16,7 +15,6 @@ MAX_ALLIES = 10
 
 SPELL_CARDS = ["Fireball", "Zap", "Arrows", "Tornado", "Rocket", "Lightning", "Freeze"]
 
-# Strategic Card Archetypes
 CARD_ARCHETYPES = {
     # Win Conditions (Building Targeting)
     "WIN_CONDITIONS": ["Giant", "Golem", "Lava Hound", "X-Bow", "Mortar", "Royal Giant", "Balloon", "Hog Rider", "Ram Rider", "Battle Ram", "Graveyard"],
