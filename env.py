@@ -80,7 +80,7 @@ class ClashRoyaleEnv:
         self.actions = Actions()
         self.rf_model = self.setup_roboflow()
         self.card_model = self.setup_card_roboflow()
-        self.state_size = 1 + 2 * (MAX_ALLIES + MAX_ENEMIES)
+        self.base_state_size = 1 + 2 * (MAX_ALLIES + MAX_ENEMIES)
 
         self.num_cards = 4
         self.grid_width = 18
@@ -90,6 +90,8 @@ class ClashRoyaleEnv:
         self.available_actions = self.get_available_actions()
         self.action_size = len(self.available_actions)
         self.current_cards = []
+        self.latest_enemy_entities = []
+        self.latest_ally_entities = []
         
         # Strategic State Tracking
         self.current_elixir = 5  # Starting elixir
@@ -196,6 +198,15 @@ class ClashRoyaleEnv:
             "next_bait_target": None,  # What we're trying to bait next
             "misdirection_active": False  # Are we currently misdirecting?
         }
+
+        self.counter_counter_map = {
+            "inferno tower": ["zap", "electro wizard", "lightning"],
+            "minion horde": ["arrows", "fireball", "baby dragon"],
+            "barbarians": ["valkyrie", "fireball", "mega knight"],
+            "tesla": ["lightning", "earthquake", "royal giant"],
+            "tornado": ["electro wizard", "bowler", "royal ghost"],
+            "rocket": ["royal giant", "hog rider", "miner"]
+        }
         
         # ⚖️ RISK-REWARD ASSESSMENT
         self.risk_assessment = {
@@ -229,6 +240,54 @@ class ClashRoyaleEnv:
         
         # Initialize combo database
         self.initialize_combo_database()
+
+        # 🏗️ HIERARCHICAL STRATEGY SELECTION
+        self.strategy_hierarchy = {
+            "high_level_strategy": "BALANCED",  # MACRO choices like PRESSURE, CONTROL, RUSH
+            "recent_strategies": [],
+            "strategy_success": {},
+            "explore_probability": 0.2  # Probability to explore new high-level plans
+        }
+
+        # 🎲 ADVERSARIAL STRATEGY MIXING (Game Theory Inspired)
+        self.strategy_mixing = {
+            "mixed_strategy": {"ATTACK": 0.33, "DEFEND": 0.33, "PRESSURE": 0.34},
+            "regret_minimization": {"ATTACK": 0.0, "DEFEND": 0.0, "PRESSURE": 0.0},
+            "last_payoffs": [],
+            "history_window": 10
+        }
+
+        # 📚 IMITATION & META-LEARNING PLACEHOLDERS
+        self.imitation_memory = {
+            "pro_patterns": [],  # Store sequences inspired by pro play
+            "successful_sequences": []
+        }
+
+        # 🧠 MULTI-AGENT AWARENESS
+        self.opponent_profiles = {
+            "current_profile": "UNKNOWN",
+            "profile_confidence": 0.0,
+            "profile_history": []
+        }
+
+        # 🔢 ADVANCED STATE FEATURE TRACKING
+        self.extra_state_features = [
+            "elixir_advantage",
+            "momentum",
+            "game_phase",
+            "pressure_level",
+            "risk_tolerance",
+            "randomization_level",
+            "forced_defense",
+            "opponent_aggression",
+            "prediction_confidence",
+            "avg_reaction_time",
+            "lane_pref_left",
+            "lane_pref_right",
+            "meta_confidence",
+            "combo_best_success"
+        ]
+        self.state_size = self.base_state_size + len(self.extra_state_features)
 
         self.game_over_flag = None
         self._endgame_thread = None
@@ -323,34 +382,54 @@ class ClashRoyaleEnv:
     
     def track_opponent_response(self, opponent_troops):
         """Track opponent's response to our last play"""
-        if not self.my_last_card or not opponent_troops:
+        if not opponent_troops:
             return
-            
+
         current_time = time.time()
-        reaction_time = current_time - self.my_last_play_time
-        
-        # Detect new opponent cards (simplified - based on troop positions)
-        if len(opponent_troops) > len(self.opponent_memory.get("last_detected_troops", [])):
-            # New opponent troop detected - likely a response
-            opponent_card = "enemy_troop"  # Generic for now
-            
+        reaction_time = current_time - self.my_last_play_time if self.my_last_play_time else 0.0
+
+        # Derive opponent card identifiers from troop metadata
+        new_responses = []
+        prev_count = len(self.opponent_memory.get("last_detected_troops", []))
+        if len(opponent_troops) > prev_count:
+            new_responses = opponent_troops[prev_count:]
+        elif opponent_troops:
+            new_responses = [opponent_troops[-1]]
+
+        for troop in new_responses:
+            opponent_card = troop.get('class', 'enemy_troop')
+            if opponent_card:
+                self.update_opponent_card_memory(opponent_card)
+
+            if not self.my_last_card:
+                continue
+
             # Track response pattern
             if self.my_last_card not in self.opponent_memory["responses_to_my_cards"]:
                 self.opponent_memory["responses_to_my_cards"][self.my_last_card] = []
-            
+
             self.opponent_memory["responses_to_my_cards"][self.my_last_card].append({
                 "response": opponent_card,
                 "reaction_time": reaction_time,
-                "position": opponent_troops[-1] if opponent_troops else None
+                "position": {"x": troop.get('x'), "y": troop.get('y')}
             })
-            
-            # Keep only last 5 responses per card
-            if len(self.opponent_memory["responses_to_my_cards"][self.my_last_card]) > 5:
+
+            # Maintain memory size
+            if len(self.opponent_memory["responses_to_my_cards"][self.my_last_card]) > 10:
                 self.opponent_memory["responses_to_my_cards"][self.my_last_card].pop(0)
-            
+
+            # Update counter pattern statistics
+            counter_key = (self.my_last_card, opponent_card)
+            self.opponent_memory["counter_patterns"][counter_key] = self.opponent_memory["counter_patterns"].get(counter_key, 0) + 1
+
+            # Track reaction time history
+            self.opponent_memory["reaction_time"].append(reaction_time)
+            if len(self.opponent_memory["reaction_time"]) > 30:
+                self.opponent_memory["reaction_time"].pop(0)
+
             print(f"📊 Opponent Response: {self.my_last_card} → {opponent_card} (⏱️{reaction_time:.1f}s)")
-        
-        self.opponent_memory["last_detected_troops"] = opponent_troops.copy()
+
+        self.opponent_memory["last_detected_troops"] = list(opponent_troops)
     
     def get_opponent_likely_counter(self, my_card):
         """Predict what opponent will likely play to counter my card"""
@@ -375,6 +454,26 @@ class ClashRoyaleEnv:
             "confidence": confidence,
             "avg_reaction_time": sum(r["reaction_time"] for r in responses) / len(responses)
         }
+
+    def update_opponent_card_memory(self, card_name):
+        """Maintain rolling memory of opponent card sequence and usage patterns"""
+        if not card_name:
+            return
+
+        card_name = card_name.lower()
+        self.opponent_memory["last_cards"].append(card_name)
+        if len(self.opponent_memory["last_cards"]) > 15:
+            self.opponent_memory["last_cards"].pop(0)
+
+        # Track simple frequency for predictive modeling
+        self.opponent_model.setdefault("card_frequency", {})
+        self.opponent_model["card_frequency"][card_name] = self.opponent_model["card_frequency"].get(card_name, 0) + 1
+
+        # Update timing pattern estimates
+        timestamp = time.time()
+        self.opponent_model.setdefault("timing_patterns", []).append(timestamp)
+        if len(self.opponent_model["timing_patterns"]) > 20:
+            self.opponent_model["timing_patterns"].pop(0)
     
     def update_position_success(self, position, was_successful):
         """Update position success tracking"""
@@ -540,6 +639,60 @@ class ClashRoyaleEnv:
             self.action_context["last_opponent_aggression"] = current_time
         
         print(f"🎮 Action Context: {self.action_context['mode']} | Phase: {self.game_state['game_phase']} | Momentum: {self.game_state['momentum']}")
+
+    def select_high_level_strategy(self, strategic_decision):
+        """🏗️ Hierarchical strategy selection guiding low-level actions"""
+        available_strategies = ["PRESSURE", "CONTROL", "RUSH", "STALL", "BALANCED"]
+        chosen_strategy = strategic_decision
+
+        # Meta-based overrides
+        detected_meta = self.meta_adaptation.get("detected_meta", "UNKNOWN")
+        if detected_meta == "BEATDOWN":
+            chosen_strategy = "PRESSURE"
+        elif detected_meta == "CONTROL":
+            chosen_strategy = "RUSH"
+        elif detected_meta == "CYCLE":
+            chosen_strategy = "CONTROL"
+
+        # Explore alternative strategies occasionally
+        if random.random() < self.strategy_hierarchy["explore_probability"]:
+            chosen_strategy = random.choice(available_strategies)
+
+        self.strategy_hierarchy["high_level_strategy"] = chosen_strategy
+        self.strategy_hierarchy["recent_strategies"].append(chosen_strategy)
+        if len(self.strategy_hierarchy["recent_strategies"]) > 15:
+            self.strategy_hierarchy["recent_strategies"].pop(0)
+
+        print(f"🏗️ High-level strategy: {chosen_strategy}")
+        return chosen_strategy
+
+    def apply_real_time_adaptations(self, opponent_troops):
+        """⚡ Apply real-time adaptation logic based on opponent behavior"""
+        if not opponent_troops:
+            return
+
+        likely_counter = None
+        if self.my_last_card:
+            counter_info = self.get_opponent_likely_counter(self.my_last_card)
+            if counter_info and counter_info.get("confidence", 0) > 0.5:
+                likely_counter = counter_info.get("counter")
+
+        if likely_counter:
+            self.strategy_patterns["deception_mode"] = True
+            self.deception["next_bait_target"] = self.my_last_card
+            print(f"⚡ Anticipating counter '{likely_counter}', preparing deception")
+
+        # Lane exploitation
+        lane_pref = self.opponent_memory.get("preferred_lanes", {})
+        if lane_pref:
+            weakest_lane = min(lane_pref, key=lane_pref.get)
+            self.position_memory["opponent_weakness_map"][weakest_lane] = min(
+                self.position_memory["opponent_weakness_map"].get(weakest_lane, 0.5) + 0.1,
+                1.0
+            )
+
+        # Update strategic mixing payoffs (simplified reward estimation)
+        self.update_strategy_mixing()
     
     def get_contextual_card_choice(self, available_cards, strategic_decision):
         """🎯 Master card selection with all advanced AI systems"""
@@ -586,9 +739,37 @@ class ClashRoyaleEnv:
         base_choice = self.get_adaptive_card_choice(available_cards, strategic_decision)
         if not base_choice:
             base_choice = playable_cards[0] if playable_cards else None
+
+        if base_choice:
+            predicted_counter = self.get_opponent_likely_counter(base_choice)
+            if predicted_counter and predicted_counter.get("confidence", 0) > 0.6:
+                counter_play = self.get_counter_to_counter(predicted_counter.get("counter"), playable_cards)
+                if counter_play and counter_play != base_choice:
+                    print(
+                        f"🛡️ Counter-counter adjustment: {base_choice} → {counter_play} "
+                        f"(anticipating {predicted_counter.get('counter')})"
+                    )
+                    base_choice = counter_play
             
         # 🎯 CONTEXTUAL CARD SELECTION
         context_mode = self.action_context["mode"]
+        high_level = self.strategy_hierarchy.get("high_level_strategy", "BALANCED")
+
+        if high_level == "RUSH" and playable_cards:
+            heavy_hitters = [c for c in playable_cards if self.get_card_cost(c) >= 5]
+            if heavy_hitters and self.current_elixir >= self.get_card_cost(heavy_hitters[0]):
+                print(f"🏃 Rush strategy prioritizing {heavy_hitters[0]}")
+                return heavy_hitters[0]
+        elif high_level == "CONTROL" and playable_cards:
+            control_cards = [c for c in playable_cards if self.detect_card_archetype(c) in ["SPELLS", "BUILDINGS"]]
+            if control_cards:
+                print(f"🛡️ Control strategy selecting {control_cards[0]}")
+                return control_cards[0]
+        elif high_level == "STALL" and playable_cards:
+            cheap_cycle = [c for c in playable_cards if self.get_card_cost(c) <= 3]
+            if cheap_cycle:
+                print(f"⏳ Stall strategy cycling {cheap_cycle[0]}")
+                return cheap_cycle[0]
         
         if context_mode == "REACTIVE":
             # Prioritize cheap defensive cards
@@ -659,6 +840,37 @@ class ClashRoyaleEnv:
             print(f"🎯 Final contextual choice: {base_choice} (risk: {final_risk_assessment['risk']:.2f}, reward: {final_risk_assessment['reward']:.2f})")
         
         return base_choice
+
+    def update_strategy_mixing(self):
+        """🚀 Update mixed strategy distribution using regret-style adjustments"""
+        payoffs = {
+            "ATTACK": self.objectives.get("successful_attacks", 0),
+            "DEFEND": self.objectives.get("successful_defenses", 0),
+            "PRESSURE": len([c for c in self.cards_played_this_game[-5:] if c])
+        }
+
+        avg_payoff = sum(payoffs.values()) / max(len(payoffs), 1)
+        for strategy, payoff in payoffs.items():
+            regret = payoff - avg_payoff
+            self.strategy_mixing["regret_minimization"][strategy] = (
+                self.strategy_mixing["regret_minimization"].get(strategy, 0.0) + regret
+            )
+
+        positive_regrets = {
+            k: max(v, 0.0) for k, v in self.strategy_mixing["regret_minimization"].items()
+        }
+        total_regret = sum(positive_regrets.values())
+        if total_regret > 0:
+            for strategy in self.strategy_mixing["mixed_strategy"].keys():
+                self.strategy_mixing["mixed_strategy"][strategy] = positive_regrets.get(strategy, 0.0) / total_regret
+        else:
+            # Default back to uniform mixing
+            for strategy in self.strategy_mixing["mixed_strategy"].keys():
+                self.strategy_mixing["mixed_strategy"][strategy] = 1 / len(self.strategy_mixing["mixed_strategy"])
+
+        self.strategy_mixing["last_payoffs"].append(payoffs)
+        if len(self.strategy_mixing["last_payoffs"]) > self.strategy_mixing.get("history_window", 10):
+            self.strategy_mixing["last_payoffs"].pop(0)
     
     def update_multi_objectives(self, prev_state, current_state, card_played, reward):
         """Update multiple learning objectives"""
@@ -717,6 +929,23 @@ class ClashRoyaleEnv:
                   f"Efficiency: {avg_efficiency:.2f}, "
                   f"Adaptation: {self.objectives['adaptation_score']}, "
                   f"Variety: {self.objectives['position_variety_score']:.2f}")
+
+        if reward > 0 and self.cards_played_this_game:
+            recent_sequence = tuple(self.cards_played_this_game[-min(4, len(self.cards_played_this_game)):])
+            if recent_sequence:
+                self.imitation_memory["successful_sequences"].append(recent_sequence)
+                if len(self.imitation_memory["successful_sequences"]) > 25:
+                    self.imitation_memory["successful_sequences"].pop(0)
+
+        current_strategy = self.strategy_hierarchy.get("high_level_strategy")
+        if current_strategy:
+            self.strategy_hierarchy["strategy_success"][current_strategy] = (
+                self.strategy_hierarchy["strategy_success"].get(current_strategy, 0) * 0.9 + max(reward, 0)
+            )
+
+        self.strategy_patterns["pattern_success"].append(1 if reward > 0 else 0)
+        if len(self.strategy_patterns["pattern_success"]) > 20:
+            self.strategy_patterns["pattern_success"].pop(0)
     
     def initialize_combo_database(self):
         """Initialize known card combinations and their synergies"""
@@ -787,27 +1016,35 @@ class ClashRoyaleEnv:
         if len(enemy_troops) > 0:
             enemy_types = [troop.get('class', 'unknown') for troop in enemy_troops]
             pattern_key = ",".join(sorted(enemy_types))
-            
-            if pattern_key in self.opponent_model["play_patterns"]:
-                self.opponent_model["play_patterns"][pattern_key] += 1
-            else:
-                self.opponent_model["play_patterns"][pattern_key] = 1
-        
-        # Predict next likely play
-        if self.opponent_model["play_patterns"]:
-            # Find most common pattern
-            most_common_pattern = max(self.opponent_model["play_patterns"], 
-                                    key=self.opponent_model["play_patterns"].get)
-            pattern_frequency = self.opponent_model["play_patterns"][most_common_pattern]
-            total_patterns = sum(self.opponent_model["play_patterns"].values())
-            
-            self.opponent_model["prediction_confidence"] = pattern_frequency / total_patterns
-            
-            if self.opponent_model["prediction_confidence"] > 0.6:
-                predicted_cards = most_common_pattern.split(",")
-                if predicted_cards:
-                    self.opponent_model["predicted_next_card"] = predicted_cards[0]
-                    print(f"🔮 Predicting opponent will play: {self.opponent_model['predicted_next_card']} (confidence: {self.opponent_model['prediction_confidence']:.2f})")
+
+            self.opponent_model.setdefault("play_patterns", {})
+            self.opponent_model["play_patterns"][pattern_key] = self.opponent_model["play_patterns"].get(pattern_key, 0) + 1
+
+        # Predict next likely play using combined evidence
+        predicted_card = None
+        confidence = 0.0
+
+        if self.opponent_model.get("card_frequency"):
+            freq_map = self.opponent_model["card_frequency"]
+            predicted_card = max(freq_map, key=freq_map.get)
+            total_freq = sum(freq_map.values()) or 1
+            confidence = freq_map[predicted_card] / total_freq
+
+        if self.opponent_model.get("play_patterns"):
+            pattern_counts = self.opponent_model["play_patterns"]
+            most_common_pattern = max(pattern_counts, key=pattern_counts.get)
+            pattern_total = sum(pattern_counts.values()) or 1
+            pattern_confidence = pattern_counts[most_common_pattern] / pattern_total
+            if pattern_confidence > confidence:
+                split_cards = most_common_pattern.split(",")
+                predicted_card = split_cards[0] if split_cards else predicted_card
+                confidence = pattern_confidence
+
+        self.opponent_model["prediction_confidence"] = confidence
+        self.opponent_model["predicted_next_card"] = predicted_card
+
+        if predicted_card and confidence > 0.5:
+            print(f"🔮 Predicting opponent will play: {predicted_card} (confidence: {confidence:.2f})")
         
         # Predict aggression level
         recent_enemy_count = len(enemy_troops)
@@ -1060,6 +1297,20 @@ class ClashRoyaleEnv:
                 return counters
         return []
     
+    def get_counter_to_counter(self, predicted_counter, available_cards):
+        """Determine which of our cards can counter the opponent's expected counter"""
+        if not predicted_counter or not available_cards:
+            return None
+
+        counter_lower = predicted_counter.lower()
+        for key, answers in self.counter_counter_map.items():
+            if key in counter_lower:
+                for answer in answers:
+                    for card in available_cards:
+                        if answer in card.lower():
+                            return card
+        return None
+
     def get_adaptive_card_choice(self, available_cards, strategy):
         """Choose card considering opponent patterns and adaptation"""
         base_choice = self.get_best_elixir_card(available_cards, strategy)
@@ -1122,31 +1373,58 @@ class ClashRoyaleEnv:
         """Analyze opponent's troops and update strategy"""
         if not enemy_troops:
             return
-            
-        # Count different troop types
+
         tank_count = 0
         swarm_count = 0
-        win_condition_count = 0
-        
-        for troop_pos in enemy_troops:
-            # For now, we can't identify specific troop types from positions
-            # But we can analyze positioning patterns
-            x, y = troop_pos['x'], troop_pos['y']
-            
-            # Troops near our towers (defensive threat)
-            if y > 0.7:
-                tank_count += 1  # Assume tanks push to towers
-            # Troops spread out (swarm pattern)
-            elif len(enemy_troops) > 3:
+        control_structures = 0
+        lane_counts = {"left": 0, "right": 0, "center": 0}
+
+        for troop in enemy_troops:
+            x = troop.get('x', 0)
+            y = troop.get('y', 0)
+            troop_class = troop.get('class', '').lower()
+
+            # Lane analysis based on x coordinate
+            if x < self.actions.WIDTH * 0.33:
+                lane_counts["left"] += 1
+            elif x > self.actions.WIDTH * 0.66:
+                lane_counts["right"] += 1
+            else:
+                lane_counts["center"] += 1
+
+            # Archetype heuristics
+            if any(keyword in troop_class for keyword in ["giant", "golem", "hound", "pekka", "tank"]):
+                tank_count += 1
+            if any(keyword in troop_class for keyword in ["minion", "skeleton", "goblin", "recruits", "swarm"]):
                 swarm_count += 1
-        
-        # Update opponent archetype based on patterns
-        if tank_count > swarm_count:
-            self.opponent_archetype = "TANKS"
+            if any(keyword in troop_class for keyword in ["mortar", "xbow", "tesla", "inferno"]):
+                control_structures += 1
+
+        # Update lane preferences memory
+        for lane, count in lane_counts.items():
+            self.opponent_memory["preferred_lanes"][lane] = self.opponent_memory["preferred_lanes"].get(lane, 0) + count
+
+        # Determine archetype with simple majority
+        if tank_count >= max(swarm_count, control_structures) and tank_count > 0:
+            self.opponent_archetype = "BEATDOWN"
+        elif control_structures > max(tank_count, swarm_count):
+            self.opponent_archetype = "CONTROL"
         elif swarm_count > 1:
             self.opponent_archetype = "SWARM"
         else:
             self.opponent_archetype = "BALANCED"
+
+        # Update opponent profile history for meta-learning
+        self.opponent_profiles["profile_history"].append(self.opponent_archetype)
+        if len(self.opponent_profiles["profile_history"]) > 20:
+            self.opponent_profiles["profile_history"].pop(0)
+
+        if self.opponent_profiles["profile_history"]:
+            history = self.opponent_profiles["profile_history"]
+            most_common_profile = max(set(history), key=history.count)
+            confidence = history.count(most_common_profile) / len(history)
+            self.opponent_profiles["current_profile"] = most_common_profile
+            self.opponent_profiles["profile_confidence"] = confidence
     
     def should_defend(self, enemy_troops):
         """Determine if we should prioritize defense"""
@@ -1433,21 +1711,16 @@ class ClashRoyaleEnv:
 
         # Parse opponent troops from current state for strategic analysis
         opponent_troops = []
-        # Extract enemy positions from state (after elixir and ally positions)
-        enemy_start_idx = 1 + 2 * MAX_ALLIES
-        for i in range(enemy_start_idx, enemy_start_idx + 2 * MAX_ENEMIES, 2):
-            if i + 1 < len(current_state):
-                ex = current_state[i]
-                ey = current_state[i + 1]
-                if ex != 0.0 or ey != 0.0:
-                    # Convert normalized coords back to pixel coords for analysis
-                    ex_px = int(ex * self.actions.WIDTH)
-                    ey_px = int(ey * self.actions.HEIGHT)
-                    opponent_troops.append({
-                        'x': ex_px, 
-                        'y': ey_px,
-                        'class': 'enemy_troop'  # Generic class since we don't have specific troop types
-                    })
+        enemy_entities = getattr(self, "latest_enemy_entities", [])
+        for entity in enemy_entities:
+            ex_norm = entity.get("x", 0.0) / self.actions.WIDTH if self.actions.WIDTH else 0.0
+            ey_norm = entity.get("y", 0.0) / self.actions.HEIGHT if self.actions.HEIGHT else 0.0
+            opponent_troops.append({
+                'x': entity.get("x", int(ex_norm * self.actions.WIDTH)),
+                'y': entity.get("y", int(ey_norm * self.actions.HEIGHT)),
+                'class': entity.get("class", "enemy_troop"),
+                'confidence': entity.get("confidence", 0.0)
+            })
 
         # Analyze opponent troops
         self.analyze_opponent_troops(opponent_troops)
@@ -1480,6 +1753,8 @@ class ClashRoyaleEnv:
         
         # ⚡ CONTEXTUAL ACTION SELECTION
         self.determine_action_context(strategic_decision, opponent_troops)
+        high_level_strategy = self.select_high_level_strategy(strategic_decision)
+        self.apply_real_time_adaptations(opponent_troops)
         
         # 🎲 ADVANCED AI SYSTEMS INTEGRATION
         # Update strategy patterns and risk tolerance based on performance
@@ -1693,6 +1968,8 @@ class ClashRoyaleEnv:
         print("Predictions:", predictions)
         if not predictions:
             print("WARNING: No predictions found in results")
+            self.latest_enemy_entities = []
+            self.latest_ally_entities = []
             return None
 
         # After getting 'predictions' from results:
@@ -1712,30 +1989,36 @@ class ClashRoyaleEnv:
         def normalize_class(cls):
             return cls.strip().lower() if isinstance(cls, str) else ""
 
-        allies = [
-            (p["x"], p["y"])
-            for p in predictions
-            if (
-                isinstance(p, dict)
-                and normalize_class(p.get("class", "")) not in TOWER_CLASSES
-                and normalize_class(p.get("class", "")).startswith("ally")
-                and "x" in p and "y" in p
-            )
-        ]
+        allies = []
+        enemies = []
+        ally_entities = []
+        enemy_entities = []
 
-        enemies = [
-            (p["x"], p["y"])
-            for p in predictions
-            if (
-                isinstance(p, dict)
-                and normalize_class(p.get("class", "")) not in TOWER_CLASSES
-                and normalize_class(p.get("class", "")).startswith("enemy")
-                and "x" in p and "y" in p
-            )
-        ]
+        for p in predictions:
+            if not isinstance(p, dict):
+                continue
+            cls = normalize_class(p.get("class", ""))
+            if cls in TOWER_CLASSES or "x" not in p or "y" not in p:
+                continue
+            entity = {
+                "class": cls,
+                "x": p["x"],
+                "y": p["y"],
+                "confidence": p.get("confidence", 0.0)
+            }
+            if cls.startswith("ally"):
+                allies.append((p["x"], p["y"]))
+                ally_entities.append(entity)
+            elif cls.startswith("enemy") or cls:
+                enemies.append((p["x"], p["y"]))
+                enemy_entities.append(entity)
 
         print("Allies:", allies)
         print("Enemies:", enemies)
+
+        # Persist latest entity information for downstream strategic modules
+        self.latest_ally_entities = ally_entities
+        self.latest_enemy_entities = enemy_entities
 
         # Normalize positions
         def normalize(units):
@@ -1755,7 +2038,55 @@ class ClashRoyaleEnv:
         ally_flat = [coord for pos in ally_positions for coord in pos]
         enemy_flat = [coord for pos in enemy_positions for coord in pos]
 
-        state = np.array([elixir / 10.0] + ally_flat + enemy_flat, dtype=np.float32)
+        # Build contextual feature vector for enhanced state representation
+        context_features = []
+
+        elixir_advantage = self.game_state.get("elixir_advantage", 0)
+        context_features.append(float(np.clip(elixir_advantage / 10.0, -1.0, 1.0)))
+
+        momentum_map = {"LOSING": -1.0, "NEUTRAL": 0.0, "WINNING": 1.0}
+        context_features.append(momentum_map.get(self.game_state.get("momentum"), 0.0))
+
+        phase_map = {"EARLY": 0.0, "MID": 0.33, "LATE": 0.66, "OVERTIME": 1.0}
+        context_features.append(phase_map.get(self.game_state.get("game_phase"), 0.0))
+
+        pressure_map = {"NONE": 0.0, "LOW": 0.33, "MEDIUM": 0.66, "HIGH": 1.0}
+        context_features.append(pressure_map.get(self.game_state.get("pressure_level"), 0.0))
+
+        context_features.append(float(np.clip(self.risk_assessment.get("risk_tolerance", 0.5), 0.0, 1.0)))
+        context_features.append(float(np.clip(self.strategy_patterns.get("randomization_level", 0.3), 0.0, 1.0)))
+
+        forced_defense = 1.0 if self.action_context.get("forced_defense") else 0.0
+        context_features.append(forced_defense)
+
+        aggression_map = {"DEFENSIVE": 0.0, "NEUTRAL": 0.5, "AGGRESSIVE": 1.0}
+        context_features.append(aggression_map.get(self.opponent_model.get("aggression_prediction"), 0.5))
+
+        context_features.append(float(np.clip(self.opponent_model.get("prediction_confidence", 0.0), 0.0, 1.0)))
+
+        recent_reactions = self.opponent_memory.get("reaction_time", [])[-5:]
+        avg_reaction = sum(recent_reactions) / len(recent_reactions) if recent_reactions else 0.0
+        context_features.append(float(np.clip(avg_reaction / 10.0, 0.0, 1.0)))
+
+        lane_pref = self.opponent_memory.get("preferred_lanes", {"left": 1.0, "right": 1.0, "center": 1.0})
+        lane_total = sum(lane_pref.values()) or 1.0
+        context_features.append(float(lane_pref.get("left", 0.0) / lane_total))
+        context_features.append(float(lane_pref.get("right", 0.0) / lane_total))
+
+        context_features.append(float(np.clip(self.meta_adaptation.get("meta_confidence", 0.0), 0.0, 1.0)))
+
+        if self.combo_system.get("combo_success_rate"):
+            best_combo_success = max(self.combo_system["combo_success_rate"].values())
+        else:
+            best_combo_success = 0.5
+        context_features.append(float(np.clip(best_combo_success, 0.0, 1.0)))
+
+        state_vector = [elixir / 10.0] + ally_flat + enemy_flat + context_features
+        state = np.array(state_vector, dtype=np.float32)
+
+        # Keep state size consistent with computed vector length
+        if len(state) != self.state_size:
+            self.state_size = len(state)
         return state
 
     def _compute_reward(self, state):
