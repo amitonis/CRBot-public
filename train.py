@@ -38,7 +38,7 @@ def train():
     # Ensure models directory exists
     os.makedirs("models", exist_ok=True)
 
-    # Load latest model if available
+    # Load latest model if available; otherwise try imitation warmstart weights
     latest_model = get_latest_model_path("models")
     if latest_model:
         agent.load(os.path.basename(latest_model))
@@ -49,38 +49,56 @@ def train():
                 meta = json.load(f)
                 agent.epsilon = meta.get("epsilon", 1.0)
             print(f"Epsilon loaded: {agent.epsilon}")
+    else:
+        warmstart_path = os.getenv("IMITATION_WARMSTART")
+        if warmstart_path:
+            resolved_path = warmstart_path
+            if not os.path.isabs(resolved_path):
+                resolved_path = os.path.join("models", warmstart_path)
+            if os.path.exists(resolved_path):
+                print(f"Using imitation warmstart weights from {resolved_path}")
+                state_dict = torch.load(resolved_path, map_location="cpu", weights_only=False)
+                agent.model.load_state_dict(state_dict, strict=False)
+                agent.update_target_model()
+                agent.epsilon = max(agent.epsilon * 0.5, agent.epsilon_min)
+                print(f"Epsilon annealed to {agent.epsilon:.3f} after warmstart")
+            else:
+                print(f"⚠️ Warmstart path '{resolved_path}' not found; proceeding with fresh weights.")
 
     controller = KeyboardController()
     episodes = 10000
     batch_size = 32
 
-    for ep in range(episodes):
-        if controller.is_exit_requested():
-            print("Training interrupted by user.")
-            break
+    try:
+        for ep in range(episodes):
+            if controller.is_exit_requested():
+                print("Training interrupted by user.")
+                break
 
-        state = env.reset()
-        print(f"Episode {ep + 1} starting. Epsilon: {agent.epsilon:.3f}")  # <-- Add this line
-        total_reward = 0
-        done = False
-        while not done:
-            action = agent.act(state)
-            next_state, reward, done = env.step(action)
-            agent.remember(state, action, reward, next_state, done)
-            agent.replay(batch_size)
-            state = next_state
-            total_reward += reward
-        print(f"Episode {ep + 1}: Total Reward = {total_reward:.2f}, Epsilon = {agent.epsilon:.3f}")
+            state = env.reset()
+            print(f"Episode {ep + 1} starting. Epsilon: {agent.epsilon:.3f}")
+            total_reward = 0
+            done = False
+            while not done:
+                action = agent.act(state)
+                next_state, reward, done = env.step(action)
+                agent.remember(state, action, reward, next_state, done)
+                agent.replay(batch_size)
+                state = next_state
+                total_reward += reward
+            print(f"Episode {ep + 1}: Total Reward = {total_reward:.2f}, Epsilon = {agent.epsilon:.3f}")
 
-        if ep % 10 == 0:
-            agent.update_target_model()
-            # Save model and epsilon every 10 episodes
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            model_path = os.path.join("models", f"model_{timestamp}.pth")
-            torch.save(agent.model.state_dict(), model_path)
-            with open(os.path.join("models", f"meta_{timestamp}.json"), "w") as f:
-                json.dump({"epsilon": agent.epsilon}, f)
-            print(f"Model and epsilon saved to {model_path}")
+            if ep % 10 == 0:
+                agent.update_target_model()
+                # Save model and epsilon every 10 episodes
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                model_path = os.path.join("models", f"model_{timestamp}.pth")
+                torch.save(agent.model.state_dict(), model_path)
+                with open(os.path.join("models", f"meta_{timestamp}.json"), "w") as f:
+                    json.dump({"epsilon": agent.epsilon}, f)
+                print(f"Model and epsilon saved to {model_path}")
+    finally:
+        env.close()
 
 if __name__ == "__main__":
     train()

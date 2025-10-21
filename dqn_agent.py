@@ -117,7 +117,8 @@ class DQNAgent:
 
         remaining = batch_size - len(batch)
         if remaining > 0:
-            remaining_pool = [exp for exp in self.memory if exp not in batch]
+            selected_ids = {id(exp) for exp in batch}
+            remaining_pool = [exp for exp in self.memory if id(exp) not in selected_ids]
             if remaining_pool:
                 sample_size = min(len(remaining_pool), remaining)
                 batch.extend(random.sample(remaining_pool, sample_size))

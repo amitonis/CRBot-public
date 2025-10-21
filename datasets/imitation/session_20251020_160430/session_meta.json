@@ -1,0 +1,10 @@
+{
+  "source": "manual_logger.py",
+  "created": "2025-10-20T16:04:30",
+  "started_at": 1760976270.5479143,
+  "notes": "",
+  "stopped_at": 1760976370.8925757,
+  "session_outcome": {
+    "reason": "manual_logger_exit"
+  }
+}

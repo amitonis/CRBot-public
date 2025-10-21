@@ -127,6 +127,12 @@ class ClashRoyaleEnv:
         self.elixir_soft_cap = float(os.getenv("ELIXIR_SOFT_CAP", str(DEFAULT_ELIXIR_SOFT_CAP)))
         self.elixir_hard_cap = float(os.getenv("ELIXIR_HARD_CAP", str(DEFAULT_ELIXIR_HARD_CAP)))
         self.elixir_leak_duration_cap = float(os.getenv("ELIXIR_LEAK_DURATION", str(DEFAULT_ELIXIR_LEAK_DURATION)))
+        self.full_elixir_threshold = float(os.getenv("ELIXIR_FULL_THRESHOLD", "9.8"))
+        self.max_full_elixir_duration = float(os.getenv("ELIXIR_MAX_FULL_DURATION", "4"))
+        self.elixir_regen_rate = float(os.getenv("ELIXIR_REGEN_RATE", "0.357"))
+        self.double_elixir_multiplier = float(os.getenv("ELIXIR_DOUBLE_MULTIPLIER", "2.0"))
+        self.triple_elixir_multiplier = float(os.getenv("ELIXIR_TRIPLE_MULTIPLIER", "3.0"))
+        self.play_cooldown = float(os.getenv("PLAY_ACTION_COOLDOWN", "0.18"))
         if self.elixir_soft_cap > self.elixir_hard_cap:
             self.elixir_soft_cap = max(self.elixir_hard_cap - 0.5, DEFAULT_ELIXIR_SOFT_CAP)
 
@@ -134,8 +140,8 @@ class ClashRoyaleEnv:
         self.available_actions = self.get_available_actions()
         self.action_size = len(self.available_actions)
         self.current_cards = []
-        self.latest_enemy_entities = []
-        self.latest_ally_entities = []
+    self.latest_enemy_entities = []
+    self.latest_ally_entities = []
         
         # Strategic State Tracking
         self.current_elixir = 5  # Starting elixir
@@ -149,6 +155,11 @@ class ClashRoyaleEnv:
         self.last_opponent_play = None
         self.elixir_leak_time = 0
         self.elixir_urgency = "LOW"  # CRITICAL, HIGH, MEDIUM, LOW, SAVE
+        self.full_elixir_timer = 0.0
+        self.force_elixir_dump = False
+        self.elixir_detection_failures = 0
+        self.last_elixir_detection = time.time()
+        self.last_card_play_time = None
         
         # 🧠 OPPONENT RESPONSE TRACKING
         self.opponent_memory = {
@@ -349,10 +360,17 @@ class ClashRoyaleEnv:
         current_time = time.time()
         time_since_last_check = current_time - self.last_elixir_check
         
+        if time_since_last_check <= 0:
+            time_since_last_check = 0.01
+
+        regen_multiplier = self._get_elixir_regen_multiplier()
+        regen_gain = self.elixir_regen_rate * regen_multiplier * time_since_last_check
+        if regen_gain > 0:
+            self.current_elixir = min(MAX_ELIXIR, self.current_elixir + regen_gain)
+
         # Get actual elixir from game
         actual_elixir = self.actions.count_elixir()
-        if actual_elixir >= 0:
-            self.current_elixir = actual_elixir
+        self._apply_elixir_detection(actual_elixir, current_time, delta_t=time_since_last_check)
         
         was_dumping = getattr(self, "elixir_dump_mode", False)
 
@@ -373,6 +391,22 @@ class ClashRoyaleEnv:
             self.elixir_urgency = "SAVE"
             self.elixir_leak_time = max(self.elixir_leak_time - time_since_last_check, 0)
 
+        if self.current_elixir >= self.full_elixir_threshold:
+            self.full_elixir_timer += time_since_last_check
+        else:
+            self.full_elixir_timer = max(self.full_elixir_timer - time_since_last_check, 0.0)
+
+        previous_force = self.force_elixir_dump
+        self.force_elixir_dump = self.full_elixir_timer >= self.max_full_elixir_duration
+
+        if self.force_elixir_dump and not previous_force:
+            print(
+                f"⚠️ Full elixir emergency: {self.current_elixir:.1f}⚡ held for "
+                f"{self.full_elixir_timer:.1f}s (limit {self.max_full_elixir_duration:.1f}s)"
+            )
+        elif not self.force_elixir_dump and previous_force:
+            print("✅ Full elixir emergency cleared")
+
         self.elixir_dump_mode = (
             self.elixir_leak_time >= self.elixir_leak_duration_cap or
             self.current_elixir >= self.elixir_hard_cap
@@ -388,6 +422,34 @@ class ClashRoyaleEnv:
     def get_card_cost(self, card_name):
         """Get elixir cost of a card"""
         return CARD_COSTS.get(card_name, 4)  # Default to 4 if unknown
+
+    def _get_elixir_regen_multiplier(self):
+        phase = self.game_state.get("game_phase", "EARLY")
+        if phase in {"LATE", "OVERTIME"}:
+            return self.double_elixir_multiplier
+        return 1.0
+
+    def _apply_elixir_detection(self, reading, current_time, *, delta_t):
+        if not isinstance(reading, (int, float)):
+            self.elixir_detection_failures += 1
+            return
+
+        if reading < 0 or reading > MAX_ELIXIR:
+            self.elixir_detection_failures += 1
+            return
+
+        # Reject obvious misreads (persistent zero or jumps larger than 5) unless detections already failing
+        if reading == 0 and self.current_elixir > 1 and delta_t < 5:
+            self.elixir_detection_failures += 1
+            return
+
+        if self.elixir_detection_failures <= 2 and abs(reading - self.current_elixir) > 5:
+            self.elixir_detection_failures += 1
+            return
+
+        self.current_elixir = float(np.clip(reading, 0.0, MAX_ELIXIR))
+        self.elixir_detection_failures = 0
+        self.last_elixir_detection = current_time
     
     def get_playable_cards(self, available_cards):
         """Get cards that can be played with current elixir"""
@@ -1941,7 +2003,8 @@ class ClashRoyaleEnv:
 
         if self.game_over_flag:
             done = True
-            reward = self._compute_reward(self._get_state())
+            terminal_state = self._get_state()
+            reward = self._compute_reward(terminal_state)
             result = self.game_over_flag
             if result == "victory":
                 reward += 100
@@ -1950,7 +2013,7 @@ class ClashRoyaleEnv:
                 reward -= 100
                 print("Defeat detected - ending episode")
             self.match_over_detected = False  # Reset for next episode
-            return self._get_state(), reward, done
+            return terminal_state, reward, done
 
         # Get current game state
         current_state = self._get_state()
@@ -1958,21 +2021,47 @@ class ClashRoyaleEnv:
             print("Failed to get game state, skipping turn")
             return self._get_state(), 0, False
 
+        pre_action_state = current_state.copy()
+
         # Update elixir management
-        current_elixir = current_state[0] * 10
+        current_elixir = pre_action_state[0] * 10
         self.update_elixir_management()
+        pre_action_state[0] = self.current_elixir / 10.0
 
         self.current_cards = self.detect_cards_in_hand()
         print("\nCurrent cards in hand:", self.current_cards)
 
+        overflow_override = False
+        overflow_card_index = None
+        overflow_card_name = None
+        if getattr(self, "force_elixir_dump", False):
+            emergency_card = self.get_best_elixir_card(self.current_cards, strategy="PREVENT_LEAK")
+            if emergency_card:
+                try:
+                    overflow_card_index = self.current_cards.index(emergency_card)
+                    overflow_card_name = emergency_card
+                    overflow_override = True
+                    print(
+                        f"⚠️ Forcing elixir dump with {emergency_card} "
+                        f"after {self.full_elixir_timer:.1f}s at {self.current_elixir:.1f}⚡"
+                    )
+                except ValueError:
+                    overflow_card_index = None
+
+        if overflow_override and overflow_card_index is None:
+            overflow_override = False
+            overflow_card_name = None
+
         # If all cards are "Unknown", click at (1611, 831) and return no-op
-        if all(card == "Unknown" for card in self.current_cards):
+        if all(card == "Unknown" for card in self.current_cards) and not overflow_override:
             print("All cards are Unknown, clicking at (1611, 831) and skipping move.")
             pyautogui.moveTo(1611, 831, duration=0.2)
             pyautogui.click()
             # Return current state, zero reward, not done
             next_state = self._get_state()
             return next_state, 0, False
+        elif all(card == "Unknown" for card in self.current_cards) and overflow_override:
+            print("⚠️ Hand detection failed but elixir overflow detected; proceeding with override anyway.")
 
         # Parse opponent troops from current state for strategic analysis
         opponent_troops = []
@@ -2004,9 +2093,9 @@ class ClashRoyaleEnv:
         our_troops = []
         ally_start_idx = 1
         for i in range(ally_start_idx, ally_start_idx + 2 * MAX_ALLIES, 2):
-            if i + 1 < len(current_state):
-                ax = current_state[i]
-                ay = current_state[i + 1]
+            if i + 1 < len(pre_action_state):
+                ax = pre_action_state[i]
+                ay = pre_action_state[i + 1]
                 if ax != 0.0 or ay != 0.0:
                     ax_px = int(ax * self.actions.WIDTH)
                     ay_px = int(ay * self.actions.HEIGHT)
@@ -2023,6 +2112,10 @@ class ClashRoyaleEnv:
         
         strategic_decision = self.get_strategic_decision(our_troops, opponent_troops)
         print(f"Strategic decision: {strategic_decision}")
+
+        if overflow_override:
+            strategic_decision = "PREVENT_LEAK"
+            print("🎯 Strategic override to PREVENT_LEAK due to full elixir")
         
         # ⚡ CONTEXTUAL ACTION SELECTION
         self.determine_action_context(strategic_decision, opponent_troops)
@@ -2043,6 +2136,15 @@ class ClashRoyaleEnv:
         # Use strategic decision to override action if needed
         action = self.available_actions[action_index]
         card_index, x_frac, y_frac = action
+        played_card_name = None
+
+        if overflow_override and overflow_card_index is not None:
+            if card_index != overflow_card_index:
+                print(
+                    f"⚡ Overriding DQN choice (slot {card_index}) with slot {overflow_card_index}"
+                    f" to dump elixir"
+                )
+            card_index = overflow_card_index
 
         # INTELLIGENT CARD SELECTION - Override DQN choice if needed for better elixir management
         if card_index != -1 and card_index < len(self.current_cards):
@@ -2130,9 +2232,16 @@ class ClashRoyaleEnv:
             self.my_last_play_time = time.time()
             self.cards_played_this_game.append(card_name)
             self.positions_used_this_game.append((x_frac, y_frac))
+            played_card_name = card_name
             
             self.actions.card_play(x, y, card_index)
-            time.sleep(1)  # You can reduce this if needed
+            time.sleep(max(0.02, self.play_cooldown))
+            self.current_elixir = max(0.0, self.current_elixir - card_cost)
+            self.last_card_play_time = time.time()
+
+            if overflow_override:
+                self.full_elixir_timer = 0.0
+                self.force_elixir_dump = False
 
             # --- Enhanced spell penalty logic ---
             if card_name in SPELL_CARDS:
@@ -2158,13 +2267,13 @@ class ClashRoyaleEnv:
         self.prev_enemy_princess_towers = current_enemy_princess_towers
 
         # 📍 ADAPTIVE LEARNING - Evaluate position success based on enemy reduction
-        current_state = self._get_state()
+        post_action_state = self._get_state()
         prev_state_for_objectives = self._get_state() if not hasattr(self, 'prev_state_snapshot') else self.prev_state_snapshot
         
         if (hasattr(self, 'my_last_position') and self.my_last_position and 
             hasattr(self, 'prev_enemy_presence') and self.prev_enemy_presence is not None):
             
-            current_enemy_presence = sum(current_state[1 + 2 * MAX_ALLIES:][1::2]) if current_state is not None else 0
+            current_enemy_presence = sum(post_action_state[1 + 2 * MAX_ALLIES:][1::2]) if post_action_state is not None else 0
             enemy_reduction = self.prev_enemy_presence - current_enemy_presence
             
             # Evaluate if our last play was successful
@@ -2176,10 +2285,10 @@ class ClashRoyaleEnv:
                 self.update_position_success(normalized_pos, was_successful)
         
         # Store state snapshot for next iteration
-        self.prev_state_snapshot = current_state.copy() if current_state is not None else None
+        self.prev_state_snapshot = post_action_state.copy() if post_action_state is not None else None
         
         done = False
-        base_reward = self._compute_reward(current_state)
+        base_reward = self._compute_reward(post_action_state)
         
         # 🎯 ENHANCED MULTI-OBJECTIVE REWARD
         objective_bonus = 0
@@ -2190,11 +2299,15 @@ class ClashRoyaleEnv:
         objective_bonus += self.objectives["adaptation_score"] * 0.5  # Bonus for adapting to opponent
         objective_bonus += self.objectives["position_variety_score"] * 1  # Bonus for position variety
         
-        total_reward = base_reward + spell_penalty + princess_tower_reward + objective_bonus
+        overflow_penalty = 0.0
+        if self.full_elixir_timer > self.max_full_elixir_duration:
+            overflow_penalty = -2.0 * (self.full_elixir_timer - self.max_full_elixir_duration + 1.0)
+
+        total_reward = base_reward + spell_penalty + princess_tower_reward + objective_bonus + overflow_penalty
         
         # 🎯 MULTI-OBJECTIVE LEARNING
         if hasattr(self, 'my_last_card'):
-            self.update_multi_objectives(prev_state_for_objectives, current_state, self.my_last_card, total_reward)
+            self.update_multi_objectives(prev_state_for_objectives, post_action_state, self.my_last_card, total_reward)
             
             # 🧩 UPDATE COMBO SUCCESS RATES
             if hasattr(self, 'combo_system') and self.combo_system.get('current_combo_setup'):
@@ -2210,12 +2323,18 @@ class ClashRoyaleEnv:
                     
                 self.combo_system['current_combo_setup'] = None  # Reset after evaluation
         
-        next_state = current_state
+        next_state = post_action_state
         return next_state, total_reward, done
 
     def _get_state(self):
         self.actions.capture_area(self.screenshot_path)
-        elixir = self.actions.count_elixir()
+        raw_elixir = self.actions.count_elixir()
+        sample_time = time.time()
+        delta_t = sample_time - getattr(self, "last_elixir_detection", sample_time)
+        if delta_t <= 0:
+            delta_t = 0.01
+        self._apply_elixir_detection(raw_elixir, sample_time, delta_t=delta_t)
+        elixir = float(np.clip(self.current_elixir, 0.0, MAX_ELIXIR))
         
         workspace_name = os.getenv('WORKSPACE_TROOP_DETECTION')
         if not workspace_name:

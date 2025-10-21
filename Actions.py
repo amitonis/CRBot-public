@@ -127,9 +127,9 @@ class Actions:
             key = self.card_keys[card_index]
             print(f"Pressing key: {key}")
             pyautogui.press(key)
-            time.sleep(0.2)
+            time.sleep(0.02)
             print(f"Moving mouse to: ({x}, {y})")
-            pyautogui.moveTo(x, y, duration=0.2)
+            pyautogui.moveTo(x, y, duration=0.04)
             print("Clicking")
             pyautogui.click()
         else:
