@@ -140,8 +140,8 @@ class ClashRoyaleEnv:
         self.available_actions = self.get_available_actions()
         self.action_size = len(self.available_actions)
         self.current_cards = []
-    self.latest_enemy_entities = []
-    self.latest_ally_entities = []
+        self.latest_enemy_entities = []
+        self.latest_ally_entities = []
         
         # Strategic State Tracking
         self.current_elixir = 5  # Starting elixir
